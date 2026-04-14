@@ -123,7 +123,17 @@ def get_pdb_output(timeout=0.5):
                 break
         except queue.Empty:
             break # Timeout reached
-    return '\n'.join(output)
+    # Strip bare (Pdb) prompt lines and the '(Pdb) ' prefix that appears on the
+    # first response line when the reader was blocked on the previous prompt.
+    # Neither is useful content for an LLM.
+    cleaned = []
+    for line in output:
+        if line.strip() == '(Pdb)':
+            continue
+        if line.startswith('(Pdb) '):
+            line = line[6:]
+        cleaned.append(line)
+    return '\n'.join(cleaned)
 
 
 def _is_local_process_alive():
@@ -799,21 +809,6 @@ def send_pdb_command(command: str) -> str:
         if not pdb_running: # send_to_pdb might set this if process ended
              return f"Command output:\n{response}" # Response already includes end notice
 
-        # Provide extra context for common navigation commands
-        # Only do this if the session is still running
-        nav_commands = ['n', 's', 'c', 'r', 'unt', 'until', 'next', 'step', 'continue', 'return']
-        if command.strip().lower() in nav_commands and pdb_running:
-            still_active = _is_remote_connected() if remote_mode else _is_local_process_alive()
-            if still_active:
-                print("Fetching context after navigation...")
-                line_context = send_to_pdb("l .")
-                still_active2 = _is_remote_connected() if remote_mode else _is_local_process_alive()
-                if pdb_running and still_active2:
-                    response += f"\n\n-- Current location --\n{line_context}"
-                else:
-                    response += "\n\n-- Session ended after navigation --"
-                    pdb_running = False
-
         return f"Command output:\n{response}"
 
     except Exception as e:
@@ -1073,49 +1068,31 @@ def restart_debug() -> str:
 
 
 @mcp.tool()
-def examine_variable(variable_name: str) -> str:
-    """Examine a variable's type, value (print), and attributes (dir) using PDB.
+def examine_variable(variable_name: str, include_attrs: bool = False) -> str:
+    """Examine a variable's value and type using PDB.
 
     Args:
         variable_name: Name of the variable to examine (e.g., 'my_var', 'self.data').
+        include_attrs: If True, also show dir() attribute list. Default False.
     """
     if not pdb_running:
         return "No active debugging session. Use start_debug or connect_remote_debug first."
 
-    # Basic print
-    p_command = f"p {variable_name}"
-    print(f"Sending command: {p_command}")
-    basic_info = send_to_pdb(p_command)
-    if not pdb_running: return f"Session ended after 'p {variable_name}'. Output:\n{basic_info}"
+    basic_info = send_to_pdb(f"p {variable_name}")
+    if not pdb_running:
+        return f"Session ended. Output:\n{basic_info}"
 
-    # Type info
-    type_command = f"p type({variable_name})"
-    print(f"Sending command: {type_command}")
-    type_info = send_to_pdb(type_command)
-    # Check if session ended, but proceed if possible
-    if not pdb_running and "Session ended" not in basic_info :
-        return f"Value:\n{basic_info}\n\nSession ended after 'p type({variable_name})'. Type Output:\n{type_info}"
+    type_info = send_to_pdb(f"p type({variable_name})")
+    if not pdb_running:
+        return f"Value: {basic_info}\nSession ended during type query."
 
-    # Attributes/methods using dir(), protect with try-except in PDB
-    dir_command = f"import inspect; print(dir({variable_name}))" # More robust than just dir()
-    print("Sending command: (inspect dir)")
-    dir_info = send_to_pdb(dir_command)
-    if not pdb_running and "Session ended" not in type_info :
-         return f"Value:\n{basic_info}\n\nType:\n{type_info}\n\nSession ended after 'dir()'. Dir Output:\n{dir_info}"
+    result = f"Value: {basic_info}\nType:  {type_info}"
 
-    # Pretty print (useful for complex objects)
-    pp_command = f"pp {variable_name}"
-    print(f"Sending command: {pp_command}")
-    pretty_info = send_to_pdb(pp_command)
-    if not pdb_running and "Session ended" not in dir_info :
-         return f"Value:\n{basic_info}\n\nType:\n{type_info}\n\nAttributes/Methods:\n{dir_info}\n\nSession ended after 'pp'. PP Output:\n{pretty_info}"
+    if include_attrs and pdb_running:
+        dir_info = send_to_pdb(f"import inspect; print(dir({variable_name}))")
+        result += f"\nAttrs: {dir_info}"
 
-    return (f"--- Variable Examination: {variable_name} ---\n\n"
-            f"Value (p):\n{basic_info}\n\n"
-            f"Pretty Value (pp):\n{pretty_info}\n\n"
-            f"Type (p type()):\n{type_info}\n\n"
-            f"Attributes/Methods (dir()):\n{dir_info}\n"
-            f"--- End Examination ---")
+    return result
 
 
 @mcp.tool()
@@ -1178,16 +1155,16 @@ def get_debug_status() -> str:
             f"Tracked Breakpoints: {bp_list or 'None'}",
         ]
 
-    # Try to get current location from PDB without advancing
+    # Use 'w' (where) for a compact stack trace — much shorter than 'l .'
     current_loc_output = "[Could not query PDB location]"
     still_active = _is_remote_connected() if remote_mode else _is_local_process_alive()
     if pdb_running and still_active:
-        current_loc_output = send_to_pdb("l .")
+        current_loc_output = send_to_pdb("w")
         if not pdb_running:
             current_loc_output += "\n -- Session ended during status check --"
 
     status_lines.append("")
-    status_lines.append("-- Current PDB Location --")
+    status_lines.append("-- Stack (w) --")
     status_lines.append(current_loc_output)
     status_lines.append("--- End Status ---")
     return '\n'.join(status_lines)
